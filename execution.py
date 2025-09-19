@@ -1,14 +1,16 @@
-# execution.py
 import os
 import pandas as pd
 from datetime import datetime
+from docxtpl import DocxTemplate
 from calendar import monthrange
+from datetime import datetime
 
 # === CONFIG ===
-base_dir    = r"C:\Users\haruk\OneDrive\Desktop\Projects\hoa_automation"
-emails_path = os.path.join(base_dir, "emails.csv")          # MUST have 'Association Name' + an email column
-output_dir  = os.path.join(base_dir, "output")
-output_csv  = os.path.join(output_dir, "letters_export.csv")
+directory       = r"C:\Users\haruk\OneDrive\Desktop\Projects\hoa_automation"
+template1_path  = os.path.join(directory, "template", "Letter 1.docx")  # {{...}} placeholders
+template2_path  = os.path.join(directory, "template", "Letter 2.docx")  # {{...}} placeholders
+emails_path     = os.path.join(directory, "emails.csv")     # map by Association Name -> Email
+output_dir      = os.path.join(directory, "output")
 
 # === HELPERS ===
 def coalesce(*vals):
@@ -28,20 +30,23 @@ def clean_street_number(val: object) -> str:
     s = coalesce(val)
     if not s:
         return ""
+    # common CSV → float artifact
     if s.endswith(".0"):
         s = s[:-2]
+
+    # If still numeric-like (e.g., "123.00" or "123.50"), try to canonicalize
     try:
         f = float(s)
         if f.is_integer():
             return str(int(f))
-        return s
+        return s  # keep as-is if it has real decimals
     except ValueError:
-        return s
+        return s  # alphanumeric like "12A" — keep original
 
 def build_full_address(row) -> str:
     """
     Build: "<Street #> <Address 1>, <City> <State> <Zip>"
-    (comma after Address 1 only if both halves exist)
+            ^ comma after Address 1 (your requirement)
     """
     street = clean_street_number(row.get('Street #'))
     addr1  = coalesce(row.get('Address 1'))
@@ -49,161 +54,196 @@ def build_full_address(row) -> str:
     state  = coalesce(row.get('State'))
     zipc   = coalesce(row.get('Zip Code'))
 
-    first_line = " ".join(p for p in [street, addr1] if p)
+    first_line = " ".join(p for p in [street, addr1] if p)  # Street# + Address1
     city_state_zip = " ".join(p for p in [city, state, zipc] if p)
 
     if first_line and city_state_zip:
-        return f"{first_line}, {city_state_zip}"
+        return f"{first_line}, {city_state_zip}"  # <- comma after Address 1
     return first_line or city_state_zip
+
+def money(x) -> str:
+    try:
+        return f"${float(str(x).replace(',', '').replace('$', '')):,.2f}"
+    except Exception:
+        return ""
 
 def pick_assoc_column(columns):
     # Be flexible if the CSV header varies
-    for c in ["Association Name", "HOA Name", "Association"]:
+    candidates = ["Association Name", "HOA Name", "Association"]
+    for c in candidates:
         if c in columns:
             return c
+    # fallback to first col name that contains 'assoc' (case-insensitive)
     for c in columns:
         if 'assoc' in c.lower():
             return c
     return None
 
-def find_email_column(columns):
-    # Choose the first column whose name contains 'email' (case-insensitive)
+def first_email_col(columns):
     for c in columns:
         if 'email' in c.lower():
             return c
     return None
 
-def normalize_key(s: str) -> str:
-    # Normalize association keys for robust matching
-    return " ".join(coalesce(s).lower().split())
-
-def money(x) -> str:
-    """Format numeric/str to $#,###.##; blank on errors."""
-    try:
-        val = float(str(x).replace(',', '').replace('$', ''))
-        return f"${val:,.2f}"
-    except Exception:
-        return ""
-
-# === FIND LATEST converted_*.csv IN base_dir ===
-converted_files = [f for f in os.listdir(base_dir) if f.startswith("converted") and f.endswith(".csv")]
+# === FIND LATEST CSV ===
+converted_files = [f for f in os.listdir(directory) if f.startswith("converted") and f.endswith(".csv")]
 if not converted_files:
     raise SystemExit("No converted CSV files found in the directory.")
-converted_files.sort(key=lambda f: os.path.getmtime(os.path.join(base_dir, f)), reverse=True)
-latest_converted = os.path.join(base_dir, converted_files[0])
+
+converted_files.sort(key=lambda f: os.path.getmtime(os.path.join(directory, f)), reverse=True)
+latest_converted = os.path.join(directory, converted_files[0])
 print(f"Opening: {latest_converted}")
 
-# === LOAD MAIN DATA ===
+# === LOAD DATA (as strings to protect 'Street #' etc.), then coerce Balance ===
 df = pd.read_csv(latest_converted, dtype=str)
+if 'Balance' not in df.columns:
+    raise SystemExit("CSV missing 'Balance' column.")
 
-# Schema guards
-required_cols = ['Balance', 'Address Type', 'Account #']
-for col in required_cols:
-    if col not in df.columns:
-        raise SystemExit(f"CSV missing '{col}' column.")
-
-assoc_col = pick_assoc_column(df.columns)
-if assoc_col is None:
-    raise SystemExit("Could not find an Association Name column in the converted CSV.")
-
-# Normalize Balance & FILTERS
+# Normalize Balance to float for filtering
 df['Balance'] = (
     df['Balance'].astype(str)
-      .str.replace(r'[\$,]', '', regex=True)
-      .replace('', '0')
-      .astype(float)
+    .str.replace(r'[\$,]', '', regex=True)
+    .replace('', '0')
+    .astype(float)
 )
 
-# 1) Drop rows with Balance < 10.00
+# Keep only balances >= $10.00
 df = df[df['Balance'] >= 10.00].copy()
 
-# 2) Keep only Property Address and Owner's Offsite Address
-df = df[df['Address Type'].isin(['Property Address', "Owner's Offsite Address"])].copy()
+# Keep only the two address types you care about
+allowed_addr_types = ['Property Address', "Owner's Offsite Address"]
+if 'Address Type' not in df.columns:
+    raise SystemExit("CSV missing 'Address Type' column.")
+df = df[df['Address Type'].isin(allowed_addr_types)].copy()
 
-# Sort & group
+# Determine association column (for emails and template)
+assoc_col = pick_assoc_column(df.columns)
+if assoc_col is None:
+    raise SystemExit("Could not find an Association Name column.")
+
+# Sort by Account # (string sort is fine; change to numeric if needed)
+if 'Account #' not in df.columns:
+    raise SystemExit("CSV missing 'Account #' column.")
 df = df.sort_values(by='Account #', ascending=True)
-grouped = df.groupby('Account #', sort=True)
 
-# === LOAD emails.csv for Association -> Email mapping (STRICT) ===
-if not os.path.exists(emails_path):
-    raise SystemExit(f"emails.csv not found: {emails_path}")
-
-em_df = pd.read_csv(emails_path, dtype=str)
-if 'Association Name' not in em_df.columns:
-    raise SystemExit("emails.csv must include 'Association Name' column.")
-email_col = find_email_column(em_df.columns)
-if email_col is None:
-    raise SystemExit("emails.csv must include an email column (name contains 'email').")
-
+# === LOAD EMAILS AND MAP BY ASSOCIATION NAME ===
 assoc_to_email = {}
-for _, r in em_df.iterrows():
-    assoc_key = normalize_key(r.get('Association Name'))
-    email_val = coalesce(r.get(email_col))
-    if assoc_key and email_val:
-        assoc_to_email.setdefault(assoc_key, email_val)
+if os.path.exists(emails_path):
+    em_df = pd.read_csv(emails_path, dtype=str)
+    if 'Association Name' not in em_df.columns:
+        # try to align with your data column name if different
+        em_assoc_col = pick_assoc_column(em_df.columns)
+    else:
+        em_assoc_col = 'Association Name'
+    em_email_col = first_email_col(em_df.columns)
 
-# === DATES ===
+    if em_assoc_col and em_email_col:
+        for _, r in em_df.iterrows():
+            assoc_key = coalesce(r.get(em_assoc_col)).lower()
+            email_val = coalesce(r.get(em_email_col))
+            if assoc_key and email_val:
+                assoc_to_email[assoc_key] = email_val
+    else:
+        print("emails.csv is missing 'Association Name' or an email column — emailAddress will be blank.")
+else:
+    print("emails.csv not found — emailAddress will be blank.")
+
+# === BUILD EXPORTS (NO DOC GENERATION) ===
+os.makedirs(output_dir, exist_ok=True)
+
+# Create date-stamped subfolder: MM-DD_YY
+date_folder = datetime.now().strftime("%m-%d_%y")
+export_dir  = os.path.join(output_dir, date_folder)
+os.makedirs(export_dir, exist_ok=True)
+
 today = datetime.now()
 today_str = today.strftime("%B %d, %Y")
 last_day = monthrange(today.year, today.month)[1]
 last_day_of_month = today.replace(day=last_day).strftime("%B %d, %Y")
 
-# === OUTPUT HEADERS (duplicates included) ===
-headers = [
+grouped = df.groupby('Account #', sort=True)
+
+# Headers for Letter 1 (single-address)
+headers_l1 = [
     "{{date}}",
     "{{ownersName}}",
     "{{propertyAddress}}",
     "{{associationName}}",
     "{{accNum}}",
-    "{{propertyAddress}}",
     "{{last_day_of_month}}",
-    "{{emailAddress}}",   # strictly from emails.csv by Association Name
-    "{{accNum}}",
+    "{{emailAddress}}",
     "{{amount}}",
 ]
 
-# === BUILD ROWS (NO DOC GENERATION, NO PER-ASSOCIATION FOLDERS) ===
-rows_matrix = []
+# Headers for Letter 2 (both addresses; includes ownersOffsiteAddress)
+headers_l2 = [
+    "{{date}}",
+    "{{ownersName}}",
+    "{{propertyAddress}}",
+    "{{associationName}}",
+    "{{accNum}}",
+    "{{last_day_of_month}}",
+    "{{emailAddress}}",
+    "{{amount}}",
+    "{{ownersOffsiteAddress}}",
+]
+
+rows_l1 = []
+rows_l2 = []
 
 for acc_num, group in grouped:
-    # Split by address type (kept so you can reuse for L1/L2 later if needed)
+    # split by address type
     prop_rows    = group[group['Address Type'] == 'Property Address']
     offsite_rows = group[group['Address Type'] == "Owner's Offsite Address"]
 
-    # Choose a source row (prefer property)
+    # Choose a source row for shared fields (prefer a property row if present)
     source_row = prop_rows.iloc[0] if len(prop_rows) else group.iloc[0]
 
     owners_name = f"{coalesce(source_row.get('First Name'))} {coalesce(source_row.get('Last Name'))}".strip()
     association = coalesce(source_row.get(assoc_col))
+    amount_str  = money(source_row.get('Balance'))
     acc_num_str = coalesce(acc_num)
 
     # Addresses
     property_address = build_full_address(prop_rows.iloc[0] if len(prop_rows) else source_row)
+    offsite_address  = build_full_address(offsite_rows.iloc[0]) if len(offsite_rows) else ""
 
-    # Email strictly from emails.csv by Association Name
-    email_addr = assoc_to_email.get(normalize_key(association), "")
+    # Email by Association Name (case-insensitive match)
+    email_addr = assoc_to_email.get(association.lower(), "") if association else ""
 
-    # Amount (from the chosen source row’s Balance)
-    amount_str = money(source_row.get('Balance'))
+    # Decide Letter type: both addresses -> Letter 2, else Letter 1
+    if len(prop_rows) and len(offsite_rows):
+        # Letter 2 row (includes ownersOffsiteAddress)
+        rows_l2.append([
+            today_str,
+            owners_name,
+            property_address,
+            association,
+            acc_num_str,
+            last_day_of_month,
+            email_addr,
+            amount_str,
+            offsite_address,
+        ])
+    else:
+        # Letter 1 row (single address only)
+        rows_l1.append([
+            today_str,
+            owners_name,
+            property_address,   # for single-address letters, this is the only address (prop or offsite)
+            association,
+            acc_num_str,
+            last_day_of_month,
+            email_addr,
+            amount_str,
+        ])
 
-    # Append one ordered row matching headers exactly (including duplicates)
-    rows_matrix.append([
-        today_str,           # {{date}}
-        owners_name,         # {{ownersName}}
-        property_address,    # {{propertyAddress}}
-        association,         # {{associationName}}
-        acc_num_str,         # {{accNum}}
-        property_address,    # {{propertyAddress}} (duplicate header)
-        last_day_of_month,   # {{last_day_of_month}}
-        email_addr,          # {{emailAddress}}
-        acc_num_str,         # {{accNum}} (duplicate header)
-        amount_str,          # {{amount}}
-    ])
+# Write CSVs into the date-stamped folder
+letter1_csv = os.path.join(export_dir, "letter1_exports.csv")
+letter2_csv = os.path.join(export_dir, "letter2_exports.csv")
 
-# === WRITE CSV ONLY ===
-os.makedirs(output_dir, exist_ok=True)
-final_df = pd.DataFrame(rows_matrix, columns=headers)  # pandas supports duplicate headers here
-final_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
+pd.DataFrame(rows_l1, columns=headers_l1).to_csv(letter1_csv, index=False, encoding="utf-8-sig")
+pd.DataFrame(rows_l2, columns=headers_l2).to_csv(letter2_csv, index=False, encoding="utf-8-sig")
 
-print(f"Wrote CSV: {output_csv}")
-print(f"Rows exported: {len(rows_matrix)}")
+print(f"Wrote CSVs:\n - {letter1_csv}\n - {letter2_csv}")
+print(f"Rows exported -> Letter1: {len(rows_l1)} | Letter2: {len(rows_l2)}")
