@@ -36,6 +36,13 @@ def safe_folder_name(name: str) -> str:
     name = clean_value(name) or "Unknown"
     return re.sub(r'[<>:\"/\\|?*]+', "_", name)
 
+def get_cell(row: pd.Series, col_name: str) -> str:
+    """Safe cell accessor that returns '' if the column is missing."""
+    try:
+        return clean_value(row.get(col_name))
+    except Exception:
+        return ""
+
 def find_input_csv(primary_path: str, basename: str, fallback_basename: str | None = None) -> str:
     """
     Find CSV in OUTPUT_DIR. Try primary_path first.
@@ -97,11 +104,14 @@ INPUT_L2_PATH = find_input_csv(
 )
 
 # === READ CSVs ===
-# Letter 1 schema: {{date}}, {{ownersName}}, {{propertyAddress}}, {{associationName}},
-#                  {{accNum}}, {{last_day_of_month}}, {{emailAddress}}, {{amount}}
+# Letter 1 schema (now includes split address fields):
+# {{date}}, {{ownersName}}, {{propertyAddress}}, {{associationName}}, {{accNum}},
+# {{last_day_of_month}}, {{emailAddress}}, {{amount}},
+# {{propertyAddress_st_unit}}, {{propertyAddress_city_state_zip}}
 df_l1 = pd.read_csv(INPUT_L1_PATH, dtype=str, encoding="utf-8-sig").fillna("")
 
-# Letter 2 schema: all of the above + {{ownersOffsiteAddress}}
+# Letter 2 schema (now includes offsite split fields):
+# all of the above + {{ownersOffsiteAddress}} + {{ownersOffsiteAddress_st_unit}}, {{ownersOffsiteAddress_city_state_zip}}
 df_l2 = pd.read_csv(INPUT_L2_PATH, dtype=str, encoding="utf-8-sig").fillna("")
 
 # === ENSURE OUTPUT DIR EXISTS ===
@@ -113,14 +123,18 @@ generated_l2 = 0
 # === GENERATE LETTER 1 DOCS ===
 if template1_exists:
     for _, row in df_l1.iterrows():
-        date_str          = clean_value(row.get("{{date}}"))
-        owners_name       = clean_value(row.get("{{ownersName}}"))
-        property_address  = clean_value(row.get("{{propertyAddress}}"))
-        association_name  = clean_value(row.get("{{associationName}}"))
-        acc_num           = clean_value(row.get("{{accNum}}"))
-        last_day_of_month = clean_value(row.get("{{last_day_of_month}}"))
-        email_address     = clean_value(row.get("{{emailAddress}}"))
-        amount_str        = clean_value(row.get("{{amount}}"))
+        date_str          = get_cell(row, "{{date}}")
+        owners_name       = get_cell(row, "{{ownersName}}")
+        property_address  = get_cell(row, "{{propertyAddress}}")
+        association_name  = get_cell(row, "{{associationName}}")
+        acc_num           = get_cell(row, "{{accNum}}")
+        last_day_of_month = get_cell(row, "{{last_day_of_month}}")
+        email_address     = get_cell(row, "{{emailAddress}}")
+        amount_str        = get_cell(row, "{{amount}}")
+
+        # NEW fields for Letter 1:
+        prop_st_unit      = get_cell(row, "{{propertyAddress_st_unit}}")
+        prop_city_state_zip = get_cell(row, "{{propertyAddress_city_state_zip}}")
 
         if not date_str:
             date_str = datetime.now().strftime("%B %d, %Y")
@@ -140,6 +154,9 @@ if template1_exists:
             "last_day_of_month": last_day_of_month,
             "emailAddress": email_address,
             "amount": amount_str,
+            # NEW in context:
+            "propertyAddress_st_unit": prop_st_unit,
+            "propertyAddress_city_state_zip": prop_city_state_zip,
         }
 
         try:
@@ -157,15 +174,19 @@ else:
 # === GENERATE LETTER 2 DOCS ===
 if template2_exists:
     for _, row in df_l2.iterrows():
-        date_str          = clean_value(row.get("{{date}}"))
-        owners_name       = clean_value(row.get("{{ownersName}}"))
-        property_address  = clean_value(row.get("{{propertyAddress}}"))
-        association_name  = clean_value(row.get("{{associationName}}"))
-        acc_num           = clean_value(row.get("{{accNum}}"))
-        last_day_of_month = clean_value(row.get("{{last_day_of_month}}"))
-        email_address     = clean_value(row.get("{{emailAddress}}"))
-        amount_str        = clean_value(row.get("{{amount}}"))
-        offsite_address   = clean_value(row.get("{{ownersOffsiteAddress}}"))
+        date_str          = get_cell(row, "{{date}}")
+        owners_name       = get_cell(row, "{{ownersName}}")
+        property_address  = get_cell(row, "{{propertyAddress}}")
+        association_name  = get_cell(row, "{{associationName}}")
+        acc_num           = get_cell(row, "{{accNum}}")
+        last_day_of_month = get_cell(row, "{{last_day_of_month}}")
+        email_address     = get_cell(row, "{{emailAddress}}")
+        amount_str        = get_cell(row, "{{amount}}")
+        offsite_address   = get_cell(row, "{{ownersOffsiteAddress}}")
+
+        # NEW fields for Letter 2:
+        off_st_unit         = get_cell(row, "{{ownersOffsiteAddress_st_unit}}")
+        off_city_state_zip  = get_cell(row, "{{ownersOffsiteAddress_city_state_zip}}")
 
         if not date_str:
             date_str = datetime.now().strftime("%B %d, %Y")
@@ -186,6 +207,9 @@ if template2_exists:
             "emailAddress": email_address,
             "amount": amount_str,
             "ownersOffsiteAddress": offsite_address,
+            # NEW in context:
+            "ownersOffsiteAddress_st_unit": off_st_unit,
+            "ownersOffsiteAddress_city_state_zip": off_city_state_zip,
         }
 
         try:
